@@ -20,7 +20,7 @@ from app.constants import (
 from app.viewport import Viewport, entity_bbox
 from app.geometry import (
     point_line_distance, segment_in_rect,
-    is_polygon_closed, safe_dxf, get_location, move_entity,
+    is_polygon_closed, safe_dxf, get_location, move_entity, clean_mtext,
 )
 from app.entities import serialize_entity, deserialize_entity
 from app.colors import aci_to_hex, tkinter_arc_direction
@@ -188,13 +188,19 @@ class DXFEditor:
         self.oda = ODAConverter()
 
         # Entity filter toggle
-        self.filter_enabled = True
+        self.filter_enabled = False
         self._render_errors: set[str] = set()
 
         # Drawing state
         self.draw_line_mode = False
         self.draw_text_mode = False
         self.line_start: tuple[float, float] | None = None
+
+        # Resize state
+        self.resizing = False
+        self.resizing_entity: Any = None
+        self.resize_start_world: tuple[float, float] | None = None
+        self.resize_initial_height: float = 10.0
 
         # Save counter for incremental saves
         self.save_counter = 0
@@ -244,9 +250,8 @@ class DXFEditor:
         tbtn("Deselez.", self._clear_selection, "Deseleziona tutto")
         sep()
 
-        # View
-        tbtn("Adatta", self._fit_view, "Adatta alla finestra")
-        tbtn("Allinea", self._align_to_origin, "Allinea selezione a origine")
+        # Align
+        tbtn("Allinea", self._align_all_to_origin, "Allinea tutto il disegno all'origine (0,0)")
         sep()
 
         # Filter toggle
@@ -290,6 +295,39 @@ class DXFEditor:
         )
         self.coord_label.pack(side=tk.RIGHT)
 
+        # ── Text Entity Panel ──────────────────────────────────────────
+        text_panel = tk.Frame(master, bg="#1A1A1A", height=80)
+        text_panel.pack(side=tk.TOP, fill=tk.X)
+        text_panel.pack_propagate(False)
+
+        tk.Label(text_panel, text="Testi:", bg="#1A1A1A", fg="#CCCCCC",
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(4, 2))
+
+        list_frame = tk.Frame(text_panel, bg="#2A2A2A")
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4), pady=2)
+
+        text_scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        self.text_listbox = tk.Listbox(
+            list_frame, bg="#2A2A2A", fg="#CCCCCC",
+            selectbackground="#4A7A4A", selectforeground="#FFFFFF",
+            font=("Consolas", 8), height=4, bd=0, highlightthickness=0,
+            yscrollcommand=text_scrollbar.set, exportselection=False
+        )
+        text_scrollbar.config(command=self.text_listbox.yview)
+        text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.text_listbox.bind("<<ListboxSelect>>", self._on_text_list_select)
+
+        self._text_entity_list: list[Any] = []
+
+        # ── Tab Bar ─────────────────────────────────────────────────────
+        self.tab_bar = tk.Frame(master, bg="#0D0D0D", height=26)
+        self.tab_bar.pack(side=tk.TOP, fill=tk.X)
+        self.tab_bar.pack_propagate(False)
+
+        self._tabs: list[dict] = []
+        self._current_tab: int = -1
+
         # ── Canvas ────────────────────────────────────────────────────
         self.canvas = tk.Canvas(master, bg=BG_COLOR, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -325,10 +363,14 @@ class DXFEditor:
         master.bind("<Control-a>", self._on_select_all)
         master.bind("<Control-o>", lambda e: self._prompt_open())
         master.bind("<Control-s>", lambda e: self._save())
+        master.bind("<Key-Escape>", self._on_escape)
 
-        # Load file if specified
+        # Init first tab
+        self._new_tab()
         if filepath:
             self.master.after(100, lambda: self._load_file(filepath))
+        else:
+            self._rebuild_tab_bar()
 
     # ── Tooltip helper ─────────────────────────────────────────────────
 
@@ -404,9 +446,20 @@ class DXFEditor:
         tools_menu.add_command(label="Deseleziona tutto",
                                command=self._clear_selection)
         tools_menu.add_separator()
+        tools_menu.add_command(label="Configura ODA Converter...",
+                               command=self._configure_oda)
+        tools_menu.add_separator()
         tools_menu.add_command(label="Informazioni file...",
                                command=self._show_info)
         menubar.add_cascade(label="Strumenti", menu=tools_menu)
+
+    def _configure_oda(self) -> None:
+        path = self.oda.prompt_path()
+        if path:
+            self._status(f"ODA Converter configurato: {path}")
+        else:
+            self._status("ODA Converter non configurato")
+        self._render()
 
     # ── Entity Filter ─────────────────────────────────────────────────
 
@@ -452,7 +505,12 @@ class DXFEditor:
     def _get_visible_entities(self) -> list[Any]:
         if self.msp is None:
             return []
-        return [e for e in self.msp if self._is_entity_visible(e)]
+        entities = list(self.msp)
+        if self.doc is not None:
+            for layout in self.doc.layouts:
+                if layout.name != "Model":
+                    entities.extend(list(layout))
+        return [e for e in entities if self._is_entity_visible(e)]
 
     # ── Draw Tools ────────────────────────────────────────────────────
 
@@ -460,6 +518,7 @@ class DXFEditor:
         self.draw_line_mode = not self.draw_line_mode
         self.draw_text_mode = False
         self.line_start = None
+        self.canvas.delete("preview")
         msg = "Linea: click primo punto" if self.draw_line_mode else "Pronto"
         self._status(msg)
         if self.draw_line_mode:
@@ -576,6 +635,13 @@ class DXFEditor:
         except Exception as e:
             messagebox.showerror("Errore", f"Impossibile leggere il DXF:\n{e}")
             return
+
+        current_is_empty = (self._current_tab >= 0
+                            and self._tabs[self._current_tab].get('doc') is None
+                            and not self._tabs[self._current_tab].get('filepath'))
+        if not current_is_empty:
+            self._new_tab()
+
         self.doc = doc
         self.msp = doc.modelspace()
         self.filepath = path
@@ -586,9 +652,10 @@ class DXFEditor:
         self.redo_stack = []
         self._render_errors.clear()
         self.save_counter = 0
-        self.master.title(f"DXF Editor - {os.path.basename(path)}")
         self._save_undo()
         self._fit_view()
+        self._rebuild_tab_bar()
+        self._update_title()
         self._render()
         self._status(f"Caricato: {os.path.basename(path)}")
 
@@ -605,7 +672,8 @@ class DXFEditor:
             self.doc.saveas(path)
             self.filepath = path
             self.modified = False
-            self.master.title(f"DXF Editor - {os.path.basename(path)}")
+            self._rebuild_tab_bar()
+            self._update_title()
             self._status(f"Salvato: {os.path.basename(path)}")
         except Exception as e:
             self.save_counter -= 1
@@ -625,9 +693,11 @@ class DXFEditor:
             self.doc.saveas(path)
             self.filepath = path
             self.modified = False
-            self.master.title(f"DXF Editor - {os.path.basename(path)}")
+            self._rebuild_tab_bar()
+            self._update_title()
             self._status(f"Salvato: {os.path.basename(path)}")
         except Exception as e:
+            self.save_counter -= 1
             messagebox.showerror("Errore", f"Salvataggio fallito:\n{e}")
 
     def _save_as_dwg(self) -> None:
@@ -644,8 +714,9 @@ class DXFEditor:
             self.doc.saveas(path)
             self.filepath = path
             self.modified = False
-            self.master.title(f"DXF Editor - {os.path.basename(path)}")
-            self._status(f"Salvato come DWG: {os.path.basename(path)}")
+            self._rebuild_tab_bar()
+            self._update_title()
+            self._status(f"Salvato: {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("Errore", f"Salvataggio DWG fallito:\n{e}")
 
@@ -771,6 +842,24 @@ class DXFEditor:
     def _get_all_entities(self) -> list[Any]:
         return self._get_visible_entities()
 
+    def _on_escape(self, event: Any = None) -> None:
+        self.selected_entities = []
+        self.selection_handles = set()
+        self.draw_line_mode = False
+        self.draw_text_mode = False
+        self.line_start = None
+        self.moving = False
+        self.move_start_world = None
+        self.drag_start = None
+        self.drag_rect = None
+        self.resizing = False
+        self.resizing_entity = None
+        self.resize_start_world = None
+        self.canvas.config(cursor="")
+        self.canvas.delete("preview")
+        self._render()
+        self._status("Pronto")
+
     def _clear_selection(self) -> None:
         self.selected_entities = []
         self.selection_handles = set()
@@ -826,10 +915,16 @@ class DXFEditor:
                             best_dist = dist
                             best_entity = entity
                 elif et in ("TEXT", "MTEXT"):
-                    ins = safe_dxf(entity, "insert")
-                    h = safe_dxf(entity, "height", 10) or 10
-                    if ins is not None:
-                        d = Vec2(wx - ins[0], wy - ins[1]).magnitude
+                    bbox = entity_bbox(entity)
+                    if bbox is not None:
+                        x1, y1 = bbox[0].x, bbox[0].y
+                        x2, y2 = bbox[1].x, bbox[1].y
+                        if x1 <= wx <= x2 and y1 <= wy <= y2:
+                            d = 0.0
+                        else:
+                            dx = 0.0 if x1 <= wx <= x2 else min(abs(wx - x1), abs(wx - x2))
+                            dy = 0.0 if y1 <= wy <= y2 else min(abs(wy - y1), abs(wy - y2))
+                            d = math.sqrt(dx * dx + dy * dy)
                         if d < best_dist:
                             best_dist = d
                             best_entity = entity
@@ -917,9 +1012,11 @@ class DXFEditor:
                     if c is not None and xmin <= c[0] <= xmax and ymin <= c[1] <= ymax:
                         self._add_to_selection(entity)
                 elif et in ("TEXT", "MTEXT"):
-                    ins = safe_dxf(entity, "insert")
-                    if ins is not None and xmin <= ins[0] <= xmax and ymin <= ins[1] <= ymax:
-                        self._add_to_selection(entity)
+                    bbox = entity_bbox(entity)
+                    if bbox is not None:
+                        if (bbox[0].x <= xmax and bbox[1].x >= xmin and
+                            bbox[0].y <= ymax and bbox[1].y >= ymin):
+                            self._add_to_selection(entity)
                 elif et == "LWPOLYLINE":
                     pts = list(entity.get_points(format='xy'))
                     for p in pts:
@@ -985,6 +1082,69 @@ class DXFEditor:
         self._status("Entità eliminate")
 
     # ── Align to Origin ──────────────────────────────────────────────
+
+    def _align_all_to_origin(self) -> None:
+        if self.msp is None:
+            return
+        entities = self._get_visible_entities()
+        if not entities:
+            self._status("Nessuna entità da allineare")
+            return
+        self._save_undo()
+        all_pts: list[Vec2] = []
+        for entity in entities:
+            et = entity.dxftype()
+            try:
+                if et == "LINE":
+                    s = safe_dxf(entity, "start")
+                    e = safe_dxf(entity, "end")
+                    if s is not None: all_pts.append(Vec2(s[0], s[1]))
+                    if e is not None: all_pts.append(Vec2(e[0], e[1]))
+                elif et == "CIRCLE":
+                    c = safe_dxf(entity, "center")
+                    if c is not None: all_pts.append(Vec2(c[0], c[1]))
+                elif et == "ARC":
+                    c = safe_dxf(entity, "center")
+                    if c is not None: all_pts.append(Vec2(c[0], c[1]))
+                elif et in ("TEXT", "MTEXT"):
+                    ins = safe_dxf(entity, "insert")
+                    if ins is not None: all_pts.append(Vec2(ins[0], ins[1]))
+                elif et == "LWPOLYLINE":
+                    for p in entity.get_points(format='xy'):
+                        all_pts.append(Vec2(p[0], p[1]))
+                elif et == "POINT":
+                    loc = safe_dxf(entity, "location")
+                    if loc is not None: all_pts.append(Vec2(loc[0], loc[1]))
+                elif et == "ELLIPSE":
+                    c = safe_dxf(entity, "center")
+                    if c is not None: all_pts.append(Vec2(c[0], c[1]))
+                elif et == "INSERT":
+                    ins = safe_dxf(entity, "insert")
+                    if ins is not None: all_pts.append(Vec2(ins[0], ins[1]))
+                elif et == "DIMENSION":
+                    for attr in ("defpoint", "defpoint2", "defpoint3", "text_midpoint"):
+                        v = safe_dxf(entity, attr, None)
+                        if v is not None: all_pts.append(Vec2(v[0], v[1]))
+                elif et in ("XLINE", "RAY"):
+                    start = safe_dxf(entity, "start")
+                    if start is not None: all_pts.append(Vec2(start[0], start[1]))
+                else:
+                    bbox = entity_bbox(entity)
+                    if bbox is not None:
+                        all_pts.append(bbox[0])
+                        all_pts.append(bbox[1])
+            except Exception:
+                continue
+        if not all_pts:
+            return
+        minx = min(p.x for p in all_pts)
+        miny = min(p.y for p in all_pts)
+        offset = Vec2(-minx, -miny)
+        for entity in entities:
+            move_entity(entity, offset)
+        self.modified = True
+        self._render()
+        self._status(f"Disegno allineato all'origine (offset: {offset.x:.2f}, {offset.y:.2f})")
 
     def _align_to_origin(self) -> None:
         if not self.selected_entities or self.msp is None:
@@ -1064,11 +1224,13 @@ class DXFEditor:
         self.canvas.delete("all")
         if self.doc is None:
             self._draw_axes()
+            self._populate_text_list()
             return
         self._draw_grid()
         self._draw_axes()
         self._draw_entities()
         self._draw_selection_highlight()
+        self._populate_text_list()
 
     def _draw_grid(self) -> None:
         w = self.canvas.winfo_width() or 800
@@ -1211,6 +1373,24 @@ class DXFEditor:
                     self.canvas.create_line(
                         x1, y1, x2, y2, fill=color, width=1, tags=("entity",)
                     )
+            elif et in ("XLINE", "RAY"):
+                start = safe_dxf(entity, "start")
+                uv = safe_dxf(entity, "unit_vector")
+                if start is not None and uv is not None:
+                    p0 = Vec2(start[0], start[1])
+                    dv = Vec2(uv[0], uv[1])
+                    extent = max(self.view.width, self.view.height) / self.view.scale * 2
+                    if et == "XLINE":
+                        p1 = p0 - dv * extent
+                        p2 = p0 + dv * extent
+                    else:
+                        p1 = p0
+                        p2 = p0 + dv * extent
+                    x1, y1 = self.view.world_to_screen(p1.x, p1.y)
+                    x2, y2 = self.view.world_to_screen(p2.x, p2.y)
+                    self.canvas.create_line(
+                        x1, y1, x2, y2, fill=color, width=1, tags=("entity",)
+                    )
             elif et == "LWPOLYLINE":
                 pts = list(entity.get_points(format='xy'))
                 if len(pts) >= 2:
@@ -1305,13 +1485,13 @@ class DXFEditor:
                     )
             elif et == "MTEXT":
                 ins = safe_dxf(entity, "insert")
-                text = safe_dxf(entity, "text", "")
+                text = getattr(entity, 'text', safe_dxf(entity, 'text', ''))
                 height = safe_dxf(entity, "char_height", 10) or 10
                 rot = safe_dxf(entity, "rotation", 0) or 0
                 if ins is not None and text:
                     sx, sy = self.view.world_to_screen(ins[0], ins[1])
                     font_size = max(8, min(48, int(height * self.view.scale * 1.2)))
-                    display_text = text[:200] + ("..." if len(text) > 200 else "")
+                    display_text = clean_mtext(text)[:200] + ("..." if len(text) > 200 else "")
                     self.canvas.create_text(
                         sx, sy, text=display_text, fill=color,
                         font=("Courier New", font_size),
@@ -1424,7 +1604,7 @@ class DXFEditor:
                 dp = safe_dxf(entity, "defpoint")
                 dp2 = safe_dxf(entity, "defpoint2")
                 dp3 = safe_dxf(entity, "defpoint3")
-                text_display = safe_dxf(entity, "text", "")
+                text_display = safe_dxf(entity, "text", "") or str(safe_dxf(entity, "measurement", ""))
                 dim_color = DIM_COLOR if not selected else HIGHLIGHT_COLOR
                 if dp is not None and dp2 is not None:
                     x1, y1 = self.view.world_to_screen(dp[0], dp[1])
@@ -1435,10 +1615,10 @@ class DXFEditor:
                     if dp3 is not None:
                         x3, y3 = self.view.world_to_screen(dp3[0], dp3[1])
                         self.canvas.create_line(
-                            x1, y1, x3, y3, fill=dim_color, width=1, tags=("entity",)
+                            x1, y1, x3, y3, fill=dim_color, width=1, dash=(3, 3), tags=("entity",)
                         )
                         self.canvas.create_line(
-                            x2, y2, x3, y3, fill=dim_color, width=1, tags=("entity",)
+                            x2, y2, x3, y3, fill=dim_color, width=1, dash=(3, 3), tags=("entity",)
                         )
                     if text_display:
                         mx = (x1 + x2) / 2
@@ -1512,6 +1692,20 @@ class DXFEditor:
                 tags=("selection",)
             )
 
+            # Resize handle for TEXT/MTEXT (top-center)
+            et = entity.dxftype()
+            if et in ("TEXT", "MTEXT"):
+                ins = safe_dxf(entity, "insert")
+                h_val = safe_dxf(entity, "height") or safe_dxf(entity, "char_height") or 10
+                if ins is not None:
+                    rx, ry = self.view.world_to_screen(ins[0], ins[1] + h_val)
+                    self.canvas.create_rectangle(
+                        rx - HANDLE_SIZE - 2, ry - HANDLE_SIZE - 2,
+                        rx + HANDLE_SIZE + 2, ry + HANDLE_SIZE + 2,
+                        fill="#FF8800", outline="white", width=1,
+                        tags=("selection",)
+                    )
+
     # ── Interaction ───────────────────────────────────────────────────
 
     def _on_lbutton_down(self, event: tk.Event) -> None:
@@ -1539,6 +1733,22 @@ class DXFEditor:
             return
 
         if self.selected_entities:
+            # Check resize handles first (TEXT/MTEXT top-center handle)
+            for entity in self.selected_entities:
+                et = entity.dxftype()
+                if et in ("TEXT", "MTEXT"):
+                    ins = safe_dxf(entity, "insert")
+                    h_val = safe_dxf(entity, "height") or safe_dxf(entity, "char_height") or 10
+                    if ins is not None:
+                        rx, ry = self.view.world_to_screen(ins[0], ins[1] + h_val)
+                        if abs(event.x - rx) < HANDLE_SIZE * 4 and abs(event.y - ry) < HANDLE_SIZE * 4:
+                            self.resizing = True
+                            self.resizing_entity = entity
+                            self.resize_start_world = (wx, wy)
+                            self.resize_initial_height = h_val
+                            self._save_undo()
+                            return
+            # Check move handle
             for entity in self.selected_entities:
                 loc = get_location(entity)
                 sx, sy = self.view.world_to_screen(loc.x, loc.y)
@@ -1550,20 +1760,54 @@ class DXFEditor:
         hit = self._hit_test(wx, wy)
         if hit:
             h = str(safe_dxf(hit, "handle", ""))
-            if h in self.selection_handles:
-                self.moving = True
-                self.move_start_world = (wx, wy)
-            else:
+            in_selection = h in self.selection_handles
+            if not in_selection:
                 self.selected_entities = [hit]
                 self.selection_handles = {h}
-                self.moving = True
-                self.move_start_world = (wx, wy)
+
+            # For TEXT/MTEXT: click in upper third of bbox → resize instead of move
+            if hit.dxftype() in ("TEXT", "MTEXT"):
+                bbox = entity_bbox(hit)
+                if bbox is not None:
+                    y_top_third = bbox[0].y + (bbox[1].y - bbox[0].y) * 2 / 3
+                    if wy >= y_top_third:
+                        h_val = safe_dxf(hit, "height") or safe_dxf(hit, "char_height") or 10
+                        self.resizing = True
+                        self.resizing_entity = hit
+                        self.resize_start_world = (wx, wy)
+                        self.resize_initial_height = h_val
+                        self._save_undo()
+                        self._render()
+                        return
+
+            self.moving = True
+            self.move_start_world = (wx, wy)
             self._render()
         else:
             self.drag_start = (event.x, event.y)
             self.drag_rect = (wx, wy, wx, wy)
 
     def _on_lbutton_move(self, event: tk.Event) -> None:
+        if self.resizing and self.resizing_entity is not None:
+            wx, wy = self.view.screen_to_world(event.x, event.y)
+            ins = safe_dxf(self.resizing_entity, "insert")
+            if ins is not None:
+                new_height = max(1.0, wy - ins[1])
+                et = self.resizing_entity.dxftype()
+                if et == "MTEXT":
+                    try:
+                        self.resizing_entity.dxf.char_height = new_height
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.resizing_entity.dxf.height = new_height
+                    except Exception:
+                        pass
+                self.modified = True
+                self._render()
+            return
+
         if self.moving and self.move_start_world is not None:
             wx, wy = self.view.screen_to_world(event.x, event.y)
             dx = wx - self.move_start_world[0]
@@ -1591,6 +1835,12 @@ class DXFEditor:
             )
 
     def _on_lbutton_up(self, event: tk.Event) -> None:
+        if self.resizing:
+            self.resizing = False
+            self.resizing_entity = None
+            self.resize_start_world = None
+            return
+
         if self.moving:
             self.moving = False
             self.move_start_world = None
@@ -1647,6 +1897,18 @@ class DXFEditor:
             f"Scala: {self.view.scale:.6f}"
         )
 
+        # Live line preview (rubber-band)
+        if self.draw_line_mode and self.line_start is not None:
+            self.canvas.delete("preview")
+            x1, y1 = self.view.world_to_screen(
+                self.line_start[0], self.line_start[1]
+            )
+            self.canvas.create_line(
+                x1, y1, event.x, event.y,
+                fill="#FF8800", width=1, dash=(4, 4),
+                tags=("preview",),
+            )
+
     def _on_configure(self, event: tk.Event) -> None:
         self.view.width = event.width
         self.view.height = event.height
@@ -1661,6 +1923,171 @@ class DXFEditor:
         else:
             self.view.fit_to(entities)
         self._render()
+
+    # ── Text Entity Panel ─────────────────────────────────────────────
+
+    def _populate_text_list(self) -> None:
+        if getattr(self, '_populating', False) or not hasattr(self, 'text_listbox'):
+            return
+        self._populating = True
+        self.text_listbox.delete(0, tk.END)
+        self._text_entity_list = []
+        selected_handles = set(self.selection_handles)
+        for entity in self._get_visible_entities():
+            et = entity.dxftype()
+            if et in ("TEXT", "MTEXT"):
+                if et == "MTEXT":
+                    text = getattr(entity, 'text', safe_dxf(entity, 'text', ''))
+                else:
+                    text = safe_dxf(entity, "text", "")
+                if text:
+                    self._text_entity_list.append(entity)
+                    display = clean_mtext(text).strip()[:80].replace('\n', ' ')
+                    self.text_listbox.insert(tk.END, display)
+        for i, entity in enumerate(self._text_entity_list):
+            if str(safe_dxf(entity, "handle", "")) in selected_handles:
+                self.text_listbox.selection_set(i)
+        self._populating = False
+
+    def _on_text_list_select(self, event: tk.Event) -> None:
+        if getattr(self, '_populating', False):
+            return
+        sel = self.text_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if 0 <= idx < len(self._text_entity_list):
+            entity = self._text_entity_list[idx]
+            self.selected_entities = [entity]
+            self.selection_handles = {str(safe_dxf(entity, "handle", ""))}
+            self._render()
+
+    # ── Tab Management ──────────────────────────────────────────────────
+
+    _TAB_KEYS = [
+        'doc', 'msp', 'filepath', 'modified', 'view',
+        'selected_entities', 'selection_handles',
+        'undo_stack', 'redo_stack', 'clipboard',
+        'filter_enabled', '_render_errors',
+        'draw_line_mode', 'draw_text_mode', 'line_start',
+        'save_counter',
+    ]
+
+    def _collect_state(self) -> dict:
+        return {k: getattr(self, k) for k in self._TAB_KEYS}
+
+    def _apply_state(self, state: dict) -> None:
+        for k, v in state.items():
+            setattr(self, k, v)
+
+    def _default_tab_state(self) -> dict:
+        return {
+            'doc': None, 'msp': None, 'filepath': None, 'modified': False,
+            'view': Viewport(),
+            'selected_entities': [], 'selection_handles': set(),
+            'undo_stack': [], 'redo_stack': [],
+            'clipboard': [],
+            'filter_enabled': False,
+            '_render_errors': set(),
+            'draw_line_mode': False, 'draw_text_mode': False, 'line_start': None,
+            'save_counter': 0,
+        }
+
+    def _new_tab(self) -> None:
+        if self._current_tab >= 0:
+            self._tabs[self._current_tab] = self._collect_state()
+        self.canvas.delete("preview")
+        self.canvas.config(cursor="")
+        self.drag_start = None
+        self.moving = False
+        self.resizing = False
+        state = self._default_tab_state()
+        self._tabs.append(state)
+        self._apply_state(state)
+        self._current_tab = len(self._tabs) - 1
+        self._rebuild_tab_bar()
+        self._update_title()
+        self._render()
+        self._status("Nuovo documento")
+
+    def _switch_tab(self, idx: int) -> None:
+        if idx == self._current_tab or idx < 0 or idx >= len(self._tabs):
+            return
+        self._tabs[self._current_tab] = self._collect_state()
+        self.canvas.delete("preview")
+        self.canvas.config(cursor="")
+        self.drag_start = None
+        self.drag_rect = None
+        self.moving = False
+        self.move_start_world = None
+        self.resizing = False
+        self.resizing_entity = None
+        self.resize_start_world = None
+        self.line_start = None
+        self._apply_state(self._tabs[idx])
+        self._current_tab = idx
+        self._rebuild_tab_bar()
+        self._update_title()
+        self._render()
+        self._status(f"Tab: {os.path.basename(self.filepath) if self.filepath else 'Nuovo'}")
+
+    def _close_tab(self, idx: int) -> None:
+        if len(self._tabs) <= 1:
+            return
+        if self._current_tab == idx:
+            self._tabs[self._current_tab] = self._collect_state()
+        self._tabs.pop(idx)
+        if self._current_tab >= idx:
+            self._current_tab = max(0, self._current_tab - 1)
+        self.canvas.delete("preview")
+        self.canvas.config(cursor="")
+        self.drag_start = None
+        self.moving = False
+        self.resizing = False
+        self._apply_state(self._tabs[self._current_tab])
+        self._rebuild_tab_bar()
+        self._update_title()
+        self._render()
+
+    def _rebuild_tab_bar(self) -> None:
+        if self._current_tab >= 0:
+            self._tabs[self._current_tab] = self._collect_state()
+        for w in self.tab_bar.winfo_children():
+            w.destroy()
+        for i, tab in enumerate(self._tabs):
+            path = tab.get('filepath')
+            title = os.path.basename(path) if path else 'Nuovo'
+            mod = tab.get('modified', False)
+            display = f'* {title}' if mod else title
+            is_active = (i == self._current_tab)
+            bg = "#2A2A2A" if is_active else "#1A1A1A"
+            fg = "#FFFFFF" if is_active else "#AAAAAA"
+            tab_frame = tk.Frame(self.tab_bar, bg=bg, bd=0)
+            tab_frame.pack(side=tk.LEFT, padx=(0, 0))
+            lbl = tk.Label(tab_frame, text=display, bg=bg, fg=fg,
+                           font=("Segoe UI", 8), padx=8, pady=2, cursor="hand2")
+            lbl.pack(side=tk.LEFT)
+            lbl.bind("<Button-1>", lambda e, idx=i: self._switch_tab(idx))
+            close_btn = tk.Label(tab_frame, text="×", bg=bg, fg="#666666",
+                                 font=("Segoe UI", 8, "bold"), padx=4, pady=2,
+                                 cursor="hand2")
+            close_btn.pack(side=tk.RIGHT)
+            close_btn.bind("<Button-1>", lambda e, idx=i: self._close_tab(idx))
+            close_btn.bind("<Enter>", lambda e, b=close_btn: b.config(fg="#FF4444"))
+            close_btn.bind("<Leave>", lambda e, b=close_btn: b.config(fg="#666666"))
+        add_btn = tk.Label(self.tab_bar, text="+", bg="#0D0D0D", fg="#888888",
+                           font=("Segoe UI", 10, "bold"), padx=8, pady=2, cursor="hand2")
+        add_btn.pack(side=tk.LEFT)
+        add_btn.bind("<Button-1>", lambda e: self._new_tab())
+        add_btn.bind("<Enter>", lambda e: add_btn.config(fg="#FFFFFF"))
+        add_btn.bind("<Leave>", lambda e: add_btn.config(fg="#888888"))
+
+    def _update_title(self) -> None:
+        if self._current_tab >= 0 and self._current_tab < len(self._tabs):
+            tab = self._tabs[self._current_tab]
+            path = tab.get('filepath')
+            title = os.path.basename(path) if path else 'nessun file'
+            self.master.title(f"DXF Editor - [{title}]")
 
     def _status(self, msg: str) -> None:
         self.status.config(text=msg)

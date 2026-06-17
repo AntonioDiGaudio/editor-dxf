@@ -177,7 +177,7 @@ class ODAConverter:
             shutil.copy2(dwg_path, tmp_input)
 
             result = subprocess.run(
-                [oda, tmp_input, tmp_output, "AC1032", "AC1032", "0", "0"],
+                [oda, tmp_input, tmp_output, "ACAD2018", "DXF", "0", "0"],
                 capture_output=True, text=True, timeout=120
             )
 

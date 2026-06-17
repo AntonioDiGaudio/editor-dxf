@@ -57,6 +57,47 @@ def get_location(entity: Any) -> Vec2:
     return Vec2(0, 0)
 
 
+def clean_mtext(raw_text: str | None) -> str:
+    if not raw_text:
+        return ""
+    raw_text = str(raw_text)
+
+    # Replace DXF escape sequences first
+    raw_text = raw_text.replace("\\\\", "\x00")  # temp protect \\
+    raw_text = raw_text.replace("\\{", "\x01")    # temp protect \{
+    raw_text = raw_text.replace("\\}", "\x02")    # temp protect \}
+
+    # Remove all \X; \NN; style formatting codes
+    # \P → newline (keep)
+    raw_text = raw_text.replace("\\P", "\n")
+    # \~ → non-breaking space → space
+    raw_text = raw_text.replace("\\~", " ")
+
+    # Remove known single-char formatting commands
+    for code in ("L", "l", "O", "o", "K", "k", "X"):
+        raw_text = raw_text.replace(f"\\{code}", "")
+
+    # Remove parameterized commands: \H2.5; \W0.8; \C1; \A1; \Ffont; \S...; \T...; \Q...
+    import re
+    raw_text = re.sub(r"(?i)\\(H|W|C|A|F|S|T|Q)[^;]*;", "", raw_text)
+
+    # Remove any remaining backslash codes (like stray \S, \P at end, etc.)
+    raw_text = re.sub(r"\\.", "", raw_text)
+
+    # Remove mtext grouping braces
+    raw_text = raw_text.replace("{", "").replace("}", "")
+
+    # Restore protected chars
+    raw_text = raw_text.replace("\x00", "\\")
+    raw_text = raw_text.replace("\x01", "{")
+    raw_text = raw_text.replace("\x02", "}")
+
+    # Collapse multiple spaces (not newlines)
+    raw_text = re.sub(r" +", " ", raw_text)
+
+    return raw_text
+
+
 def move_entity(entity: Any, offset: Vec2) -> None:
     et = entity.dxftype()
     try:
