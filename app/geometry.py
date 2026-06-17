@@ -87,6 +87,19 @@ def clean_mtext(raw_text: str | None) -> str:
     # Remove mtext grouping braces
     raw_text = raw_text.replace("{", "").replace("}", "")
 
+    # AutoCAD %%-codes (used in TEXT, sometimes MTEXT):
+    #   %%d = degree, %%c = diameter, %%p = plus/minus,
+    #   %%u/%%o = under/over-line toggle, %%% = literal percent
+    raw_text = re.sub(r"(?i)%%d", "°", raw_text)
+    raw_text = re.sub(r"(?i)%%c", "ø", raw_text)
+    raw_text = re.sub(r"(?i)%%p", "±", raw_text)
+    raw_text = re.sub(r"(?i)%%[uo]", "", raw_text)
+    raw_text = raw_text.replace("%%%", "%")
+    # %%nnn → character by code
+    raw_text = re.sub(r"%%(\d{1,3})",
+                      lambda m: chr(int(m.group(1))) if int(m.group(1)) < 0x110000 else "",
+                      raw_text)
+
     # Restore protected chars
     raw_text = raw_text.replace("\x00", "\\")
     raw_text = raw_text.replace("\x01", "{")

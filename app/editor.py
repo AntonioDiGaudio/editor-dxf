@@ -496,7 +496,10 @@ class DXFEditor:
                 layer = self.doc.layers.get(layer_name)
                 flags = safe_dxf(layer, "flags", 0) or 0
                 is_off = safe_dxf(layer, "off", False)
-                if flags & 1 or flags & 2 or is_off:
+                # bit 1 = frozen (hide). bit 2 = "frozen by default in new
+                # viewports" is only a default, NOT actually frozen → keep
+                # visible. bit 4 = locked → still visible.
+                if flags & 1 or is_off:
                     return False
         except Exception:
             pass
@@ -1472,7 +1475,7 @@ class DXFEditor:
                         )
             elif et == "TEXT":
                 ins = safe_dxf(entity, "insert")
-                text = safe_dxf(entity, "text", "")
+                text = clean_mtext(safe_dxf(entity, "text", ""))
                 height = safe_dxf(entity, "height", 10) or 10
                 rot = safe_dxf(entity, "rotation", 0) or 0
                 if ins is not None and text:
@@ -1601,31 +1604,18 @@ class DXFEditor:
                                         width=0, stipple="gray25", tags=("entity",)
                                     )
             elif et == "DIMENSION":
-                dp = safe_dxf(entity, "defpoint")
-                dp2 = safe_dxf(entity, "defpoint2")
-                dp3 = safe_dxf(entity, "defpoint3")
-                text_display = safe_dxf(entity, "text", "") or str(safe_dxf(entity, "measurement", ""))
-                dim_color = DIM_COLOR if not selected else HIGHLIGHT_COLOR
-                if dp is not None and dp2 is not None:
-                    x1, y1 = self.view.world_to_screen(dp[0], dp[1])
-                    x2, y2 = self.view.world_to_screen(dp2[0], dp2[1])
-                    self.canvas.create_line(
-                        x1, y1, x2, y2, fill=dim_color, width=1, tags=("entity",)
-                    )
-                    if dp3 is not None:
-                        x3, y3 = self.view.world_to_screen(dp3[0], dp3[1])
+                # Draw the real dimension geometry (dim line, extension lines,
+                # arrows, measurement text) from its anonymous block.
+                if not self._draw_virtual(entity):
+                    # Fallback: crude approximation from defpoints
+                    dp = safe_dxf(entity, "defpoint")
+                    dp2 = safe_dxf(entity, "defpoint2")
+                    dim_color = DIM_COLOR if not selected else HIGHLIGHT_COLOR
+                    if dp is not None and dp2 is not None:
+                        x1, y1 = self.view.world_to_screen(dp[0], dp[1])
+                        x2, y2 = self.view.world_to_screen(dp2[0], dp2[1])
                         self.canvas.create_line(
-                            x1, y1, x3, y3, fill=dim_color, width=1, dash=(3, 3), tags=("entity",)
-                        )
-                        self.canvas.create_line(
-                            x2, y2, x3, y3, fill=dim_color, width=1, dash=(3, 3), tags=("entity",)
-                        )
-                    if text_display:
-                        mx = (x1 + x2) / 2
-                        my = (y1 + y2) / 2 - 12
-                        self.canvas.create_text(
-                            mx, my, text=str(text_display),
-                            fill=dim_color, font=("Courier New", 9), tags=("entity",)
+                            x1, y1, x2, y2, fill=dim_color, width=1, tags=("entity",)
                         )
             elif et == "SPLINE":
                 ctrl = safe_dxf(entity, "control_points", None)
@@ -1641,20 +1631,20 @@ class DXFEditor:
                         *coords, fill=color, width=1, smooth=True, tags=("entity",)
                     )
             elif et == "INSERT":
-                ins = safe_dxf(entity, "insert")
-                name = safe_dxf(entity, "name", "")
-                rot = safe_dxf(entity, "rotation", 0) or 0
-                if ins is not None:
-                    sx, sy = self.view.world_to_screen(ins[0], ins[1])
-                    # Small cross marker instead of block name text
-                    self.canvas.create_line(
-                        sx - 3, sy - 3, sx + 3, sy + 3,
-                        fill=color, width=1, tags=("entity",)
-                    )
-                    self.canvas.create_line(
-                        sx - 3, sy + 3, sx + 3, sy - 3,
-                        fill=color, width=1, tags=("entity",)
-                    )
+                # Draw the actual block content (lines, arcs, text, ...)
+                # transformed to its insertion point/scale/rotation.
+                if not self._draw_virtual(entity):
+                    ins = safe_dxf(entity, "insert")
+                    if ins is not None:
+                        sx, sy = self.view.world_to_screen(ins[0], ins[1])
+                        self.canvas.create_line(
+                            sx - 3, sy - 3, sx + 3, sy + 3,
+                            fill=color, width=1, tags=("entity",)
+                        )
+                        self.canvas.create_line(
+                            sx - 3, sy + 3, sx + 3, sy - 3,
+                            fill=color, width=1, tags=("entity",)
+                        )
             else:
                 loc = get_location(entity)
                 sx, sy = self.view.world_to_screen(loc.x, loc.y)
@@ -1667,6 +1657,26 @@ class DXFEditor:
             if err_key not in self._render_errors:
                 self._render_errors.add(err_key)
                 print(f"Render error {err_key}")
+
+    def _draw_virtual(self, entity: Any, depth: int = 0) -> bool:
+        """Render the real geometry of a block reference / dimension by
+        exploding it into virtual sub-entities. Returns True if anything
+        was drawn. Nested INSERTs are handled recursively via _draw_entity.
+        """
+        if depth > 8:
+            return False
+        try:
+            subs = list(entity.virtual_entities())
+        except Exception:
+            return False
+        drawn = False
+        for sub in subs:
+            try:
+                self._draw_entity(sub)
+                drawn = True
+            except Exception:
+                pass
+        return drawn
 
     def _draw_entities(self) -> None:
         for entity in self._get_visible_entities():
