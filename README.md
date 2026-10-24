@@ -2,6 +2,10 @@
 
 Editor grafico per file DXF basato su Python, tkinter ed ezdxf.
 
+<p align="center">
+  <img src="docs/brag.gif" alt="DXF Editor: apertura di una pianta, selezione, eliminazione e annulla, disegno di linee" width="480">
+</p>
+
 ## Funzionalità
 
 - **Apri/Salva** file DXF (Ctrl+O / Ctrl+S) — il salvataggio crea una copia incrementale (`nome_1.dxf`, `nome_2.dxf`), senza modificare l'originale
